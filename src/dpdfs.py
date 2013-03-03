@@ -1,22 +1,28 @@
 #!/usr/bin/env python
 
-import os, errno, sys, threading, collections, uuid, shutil, traceback
+import os, errno, sys, threading, collections, uuid, shutil, traceback, random, select, threading, time
 from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
 import libtorrent as lt
 import hgapi as hg
+import pybonjour
 
 class TmpFile(object):
   def __init__(self, path):
     self.path = path
 
 class DPDFS(LoggingMixIn, Operations):
-  def __init__(self, name, root):
+  def __init__(self, name, root, create=False):
     self.name = name
     self.root = os.path.realpath(root)
     self.hgdb = os.path.join(self.root, 'hgdb')
     self.tmp = os.path.join(self.root, 'tmp')
     self.dat = os.path.join(self.root, 'dat')
     self.shadow = os.path.join(self.root, 'shadow')
+    self.port = random.randint(10000, 20000)
+    
+    t = threading.Thread(target=self.__start_listening_bonjour)
+    t.daemon = True
+    t.start()
     
     if not os.path.isdir(self.hgdb): os.makedirs(self.hgdb)
     self.repo = hg.Repo(self.hgdb)
@@ -27,16 +33,96 @@ class DPDFS(LoggingMixIn, Operations):
         if self.name != existing_name:
           raise Exception('volume name "%s" != existing volume name "%s"' % (self.name, existing_name))
     else:
-      with open(vfn,'w') as f:
-        f.write(self.name)
-      self.repo.hg_init()
+      if create:
+        with open(vfn,'w') as f:
+          f.write(self.name)
+        self.repo.hg_init()
+      else:
+        for i in range(30):
+          if peers:
+            print 'found peer!', peers
+            break
+          time.sleep(1)
+        if not peers:
+          raise Exception('--create not specified, no repo exists and no peers found')
+        raise Exception('not implemented')
+        
     
     if not os.path.isdir(self.tmp): os.makedirs(self.tmp)
+    for fn in os.listdir(self.tmp): os.remove(os.path.join(self.tmp,fn))
     if not os.path.isdir(self.dat): os.makedirs(self.dat)
     if not os.path.isdir(self.shadow): os.makedirs(self.shadow)
     self.rwlock = threading.Lock()
     self.open_files = {}
     print 'init', self.hgdb
+    t = threading.Thread(target=self.__register, args=())
+    t.daemon = True
+    t.start()
+
+
+  def __start_listening_bonjour(self):
+    browse_sdRef = pybonjour.DNSServiceBrowse(regtype="_dpdfs._tcp", callBack=self.__bonjour_browse_callback)
+    try:
+      try:
+        while True:
+          ready = select.select([browse_sdRef], [], [])
+          if browse_sdRef in ready[0]:
+            pybonjour.DNSServiceProcessResult(browse_sdRef)
+      except KeyboardInterrupt:
+          pass
+    finally:
+      browse_sdRef.close()
+
+  def __bonjour_browse_callback(self, sdRef, flags, interfaceIndex, errorCode, serviceName, regtype, replyDomain):
+    #print 'browse_callback', sdRef, flags, interfaceIndex, errorCode, serviceName, regtype, replyDomain
+    if errorCode != pybonjour.kDNSServiceErr_NoError:
+        return
+    if not (flags & pybonjour.kDNSServiceFlagsAdd):
+        print 'browse_callback service removed', sdRef, flags, interfaceIndex, errorCode, serviceName, regtype, replyDomain
+        return
+    #print 'Service added; resolving'
+    resolve_sdRef = pybonjour.DNSServiceResolve(0, interfaceIndex, serviceName, regtype, replyDomain, self.__bonjour_resolve_callback)
+    try:
+      while not resolved:
+        ready = select.select([resolve_sdRef], [], [], 5)
+        if resolve_sdRef not in ready[0]:
+          #print 'Resolve timed out'
+          break
+        pybonjour.DNSServiceProcessResult(resolve_sdRef)
+      else:
+        resolved.pop()
+    finally:
+      resolve_sdRef.close()
+
+  def __bonjour_resolve_callback(self, sdRef, flags, interfaceIndex, errorCode, fullname, hosttarget, port, txtRecord):
+    #print 'resolve_callback', sdRef, flags, interfaceIndex, errorCode, fullname, hosttarget, port, txtRecord
+    if errorCode == pybonjour.kDNSServiceErr_NoError:
+      if port==self.port:
+        #print 'ignoring my own service'
+        return
+      if not fullname.startswith(self.name+'._dpdfs._tcp'):
+        #print 'ignoring unrelated service', fullname
+        return
+      resolved.append(True)
+      peers.add((hosttarget,port))
+      print 'peers', peers
+
+  
+  def __register(self):
+    #return
+    print 'registering bonjour listener...'
+    bjservice = pybonjour.DNSServiceRegister(name=self.name, regtype="_dpdfs._tcp", port=self.port, callBack=self.__bonjour_register_callback)
+    try:
+      while True:
+        ready = select.select([bjservice], [], [])
+        if bjservice in ready[0]:
+          pybonjour.DNSServiceProcessResult(bjservice)
+    except KeyboardInterrupt:
+      pass
+
+  def __bonjour_register_callback(self, sdRef, flags, errorCode, name, regtype, domain):
+    if errorCode == pybonjour.kDNSServiceErr_NoError:
+      print '...bonjour listener', name+regtype+domain, 'now listening on', self.port
 
   def __call__(self, op, path, *args):
     print op, path, ('...data...' if op=='write' else args)
@@ -227,10 +313,20 @@ def get_torrent_dict(fn):
     return lt.bdecode(f.read())
 
 
+
+
+resolved = []
+peers = set()
+
+
+
+
 if __name__ == '__main__':
-  if len(sys.argv) != 4:
-    print('usage: %s <name> <root> <mountpoint>' % sys.argv[0])
+  create = '--create' in sys.argv
+  args = [x for x in sys.argv if not x.startswith('-')]
+  if len(args) != 4:
+    print('usage: %s [--create] <name> <root> <mountpoint>' % sys.argv[0])
     sys.exit(1)
 
-  fuse = FUSE(DPDFS(sys.argv[1], sys.argv[2]), sys.argv[3], foreground=True)
+  fuse = FUSE(DPDFS(args[1], args[2], create=create), args[3], foreground=True)
 
