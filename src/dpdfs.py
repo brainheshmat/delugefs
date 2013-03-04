@@ -5,10 +5,15 @@ from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
 import libtorrent as lt
 import hgapi as hg
 import pybonjour
+import jsonrpc
 
-class TmpFile(object):
-  def __init__(self, path):
-    self.path = path
+class Peer(object):
+  def __init__(self, service_name, host, port):
+    self.service_name = service_name
+    self.host = host
+    self.port = port
+    self.server = jsonrpc.ServerProxy(jsonrpc.JsonRpc20(), jsonrpc.TransportTcpIp(addr=(host,port)))
+    self.hg_port = self.server.get_hg_port()
 
 class DPDFS(LoggingMixIn, Operations):
   def __init__(self, name, root, create=False):
@@ -18,7 +23,10 @@ class DPDFS(LoggingMixIn, Operations):
     self.tmp = os.path.join(self.root, 'tmp')
     self.dat = os.path.join(self.root, 'dat')
     self.shadow = os.path.join(self.root, 'shadow')
-    self.port = random.randint(10000, 20000)
+    self.rpc_port = random.randint(10000, 20000)
+    self.hg_port = random.randint(10000, 20000)
+    self.peers = {}
+    self.should_push = False
     
     t = threading.Thread(target=self.__start_listening_bonjour)
     t.daemon = True
@@ -37,15 +45,32 @@ class DPDFS(LoggingMixIn, Operations):
         with open(vfn,'w') as f:
           f.write(self.name)
         self.repo.hg_init()
+        self.__add_push_allow()
       else:
         for i in range(30):
-          if peers:
-            print 'found peer!', peers
+          if self.peers:
+            print 'found peer!', self.peers
             break
           time.sleep(1)
-        if not peers:
+        if not self.peers:
           raise Exception('--create not specified, no repo exists and no peers found')
-        raise Exception('not implemented')
+        
+        try:
+          apeer = self.peers[iter(self.peers).next()]
+          #server = jsonrpc.ServerProxy(jsonrpc.JsonRpc20(), jsonrpc.TransportTcpIp(addr=addr))
+          #remote_hg_port = apeer.server.get_hg_port()
+          self.repo.hg_init()
+          self.__add_push_allow()
+          self.repo.hg_pull('http://%s:%i' % (apeer.host, apeer.hg_port))
+          with open(vfn,'w') as f:
+            f.write(self.name)
+          self.repo.hg_update('tip')
+        except Exception as e:
+          if os.path.isdir(os.path.join(self.hgdb, '.hg')):
+            shutil.rmtree(os.path.join(self.hgdb, '.hg'))
+          traceback.print_exc()
+          raise e
+        print 'success cloning repo!'
         
     
     if not os.path.isdir(self.tmp): os.makedirs(self.tmp)
@@ -59,6 +84,25 @@ class DPDFS(LoggingMixIn, Operations):
     t.daemon = True
     t.start()
 
+    t = threading.Thread(target=self.__keep_pushing)
+    t.daemon = True
+    t.start()
+
+
+  def __add_push_allow(self):
+    pass
+    #with open(os.path.join(self.hgdb, '.hg', 'hgrc'), 'a') as f:
+    #  f.write("\n[web]\npush_ssl = false\n")
+
+
+  def __keep_pushing(self):
+    while True:
+      if self.should_push:
+        for peer in self.peers.values():
+          #self.repo.hg_push('http://%s:%i' % (peer.host, peer.hg_port))
+          peer.server.you_should_pull_from(self.bj_name)
+        self.should_push = False
+      time.sleep(10)
 
   def __start_listening_bonjour(self):
     browse_sdRef = pybonjour.DNSServiceBrowse(regtype="_dpdfs._tcp", callBack=self.__bonjour_browse_callback)
@@ -78,7 +122,10 @@ class DPDFS(LoggingMixIn, Operations):
     if errorCode != pybonjour.kDNSServiceErr_NoError:
         return
     if not (flags & pybonjour.kDNSServiceFlagsAdd):
-        print 'browse_callback service removed', sdRef, flags, interfaceIndex, errorCode, serviceName, regtype, replyDomain
+        #print 'browse_callback service removed', sdRef, flags, interfaceIndex, errorCode, serviceName, regtype, replyDomain
+        if serviceName in self.peers:
+          del self.peers[serviceName]
+        print 'self.peers', self.peers
         return
     #print 'Service added; resolving'
     resolve_sdRef = pybonjour.DNSServiceResolve(0, interfaceIndex, serviceName, regtype, replyDomain, self.__bonjour_resolve_callback)
@@ -95,23 +142,52 @@ class DPDFS(LoggingMixIn, Operations):
       resolve_sdRef.close()
 
   def __bonjour_resolve_callback(self, sdRef, flags, interfaceIndex, errorCode, fullname, hosttarget, port, txtRecord):
-    #print 'resolve_callback', sdRef, flags, interfaceIndex, errorCode, fullname, hosttarget, port, txtRecord
     if errorCode == pybonjour.kDNSServiceErr_NoError:
-      if port==self.port:
+      if port==self.rpc_port:
         #print 'ignoring my own service'
         return
-      if not fullname.startswith(self.name+'._dpdfs._tcp'):
+      if not (fullname.startswith(self.name+'__') and '._dpdfs._tcp.' in fullname):
         #print 'ignoring unrelated service', fullname
         return
+      #print 'resolve_callback', sdRef, flags, interfaceIndex, errorCode, fullname, hosttarget, port, txtRecord
+      sname = fullname[:fullname.index('.')]
       resolved.append(True)
-      peers.add((hosttarget,port))
-      print 'peers', peers
+      self.peers[sname] = Peer(sname, hosttarget, port)
+      print 'self.peers', self.peers
 
+
+  def get_hg_port(self):
+    return self.hg_port
+    
+  def you_should_pull_from(self, peer_name):
+    if peer_name in self.peers:
+      apeer = self.peers[peer_name]
+      self.repo.hg_pull('http://%s:%i' % (apeer.host, apeer.hg_port))
+      self.repo.hg_update('tip')
+      return 'i updated, thanks!'
+    else:
+      return "i don't know you, "+ peer_name
   
   def __register(self):
     #return
+
+    server = jsonrpc.Server(jsonrpc.JsonRpc20(), jsonrpc.TransportTcpIp(addr=('', self.rpc_port), logfunc=jsonrpc.log_file("myrpc.%i.log"%self.rpc_port)))
+    server.register_function(self.get_hg_port)
+    server.register_function(self.you_should_pull_from)
+    t = threading.Thread(target=server.serve)
+    t.daemon = True
+    t.start()
+
+    t = threading.Thread(target=self.repo.hg_serve, args=(self.hg_port,))
+    t.daemon = True
+    t.start()
+    print 'http://localhost:%i/' % self.hg_port
+
+    
     print 'registering bonjour listener...'
-    bjservice = pybonjour.DNSServiceRegister(name=self.name, regtype="_dpdfs._tcp", port=self.port, callBack=self.__bonjour_register_callback)
+    self.bj_name = self.name+'__'+uuid.uuid4().hex
+    bjservice = pybonjour.DNSServiceRegister(name=self.bj_name, regtype="_dpdfs._tcp", 
+                                             port=self.rpc_port, callBack=self.__bonjour_register_callback)
     try:
       while True:
         ready = select.select([bjservice], [], [])
@@ -122,7 +198,7 @@ class DPDFS(LoggingMixIn, Operations):
 
   def __bonjour_register_callback(self, sdRef, flags, errorCode, name, regtype, domain):
     if errorCode == pybonjour.kDNSServiceErr_NoError:
-      print '...bonjour listener', name+regtype+domain, 'now listening on', self.port
+      print '...bonjour listener', name+'.'+regtype+domain, 'now listening on', self.rpc_port
 
   def __call__(self, op, path, *args):
     print op, path, ('...data...' if op=='write' else args)
@@ -187,6 +263,7 @@ class DPDFS(LoggingMixIn, Operations):
         f.write("hg doesn't track empty dirs, so we add this file...")
       self.repo.hg_add(fn+'/.__dpdfs_dir__')
       self.repo.hg_commit('mkdir %s' % path, files=[fn+'/.__dpdfs_dir__'])
+      self.should_push = True
       return ret
 
   def read(self, path, size, offset, fh):
@@ -260,6 +337,7 @@ class DPDFS(LoggingMixIn, Operations):
       os.symlink(os.path.join(dat_dir, uid), self.shadow+path)
       #print 'committing', self.hgdb+path
       self.repo.hg_commit('wrote %s' % path, files=[self.hgdb+path])
+      self.should_push = True
     except Exception as e:
       traceback.print_exc()
       raise e
@@ -268,6 +346,7 @@ class DPDFS(LoggingMixIn, Operations):
     with self.rwlock:
       self.repo.hg_rename(self.hgdb+old, self.hgdb+new)
       self.repo.hg_commit('rename %s to %s' % (old,new), files=[self.hgdb+old, self.hgdb+new])
+      self.should_push = True
 
 #  rmdir = os.rmdir
 
@@ -275,6 +354,7 @@ class DPDFS(LoggingMixIn, Operations):
     with self.rwlock:
       self.repo.hg_remove(self.hgdb+path+'/.__dpdfs_dir__')
       self.repo.hg_commit('rmdir %s' % path, files=[self.hgdb+path+'/.__dpdfs_dir__'])
+      self.should_push = True
       #return os.rmdir(self.hgdb+path)
 
   def statfs(self, path):
@@ -300,6 +380,7 @@ class DPDFS(LoggingMixIn, Operations):
     with self.rwlock:
       self.repo.hg_remove(self.hgdb+path)
       self.repo.hg_commit('unlink %s' % path, files=[self.hgdb+path])
+      self.should_push = True
 
   def write(self, path, data, offset, fh):
     with self.rwlock:
@@ -316,7 +397,7 @@ def get_torrent_dict(fn):
 
 
 resolved = []
-peers = set()
+
 
 
 

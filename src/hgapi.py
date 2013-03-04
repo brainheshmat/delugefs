@@ -65,10 +65,9 @@ class Repo(object):
     def hg_command(self, *args):
         """Run a hg command in path and return the result.
         Throws on error."""    
-        proc = Popen(["hg", "--cwd", self.path, "--encoding", "UTF-8"] + list(args), stdout=PIPE, stderr=PIPE, env=self._env)
-
-        out, err = [x.decode("utf-8") for x in  proc.communicate()]
         print (" ".join(["hg",] + ['"%s"'%x if ' ' in x else x for x in args]))
+        proc = Popen(["hg", "--cwd", self.path, "--encoding", "UTF-8"] + list(args), stdout=PIPE, stderr=PIPE, env=self._env)
+        out, err = [x.decode("utf-8") for x in  proc.communicate()]
 
         if proc.returncode:
             cmd = (" ".join(["hg", "--cwd", self.path] + list(args)))
@@ -80,6 +79,18 @@ class Repo(object):
     def hg_init(self):
         """Initialize a new repo"""
         self.hg_command("init")
+
+    def hg_serve(self, port):
+        """Initialize a new repo"""
+        self.hg_command("serve", '-p', str(port))
+
+    def hg_pull(self, url):
+        """Initialize a new repo"""
+        self.hg_command("pull", str(url))
+
+    def hg_push(self, url):
+        """Initialize a new repo"""
+        self.hg_command("push", str(url))
 
     def hg_id(self):
         """Get the output of the hg id command (truncated node)"""
