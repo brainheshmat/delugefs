@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-import os, errno, sys, threading, collections, uuid, shutil, traceback, random, select, threading, time
+import os, errno, sys, threading, collections, uuid, shutil, traceback, random, select, threading, time, socket
 from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
 import libtorrent as lt
 import hgapi as hg
@@ -11,9 +11,11 @@ class Peer(object):
   def __init__(self, service_name, host, port):
     self.service_name = service_name
     self.host = host
+    self.addr = socket.gethostbyname(host)
     self.port = port
     self.server = jsonrpc.ServerProxy(jsonrpc.JsonRpc20(), jsonrpc.TransportTcpIp(addr=(host,port)))
     self.hg_port = self.server.get_hg_port()
+    self.bt_port = self.server.get_bt_port()
 
 class DPDFS(LoggingMixIn, Operations):
   def __init__(self, name, root, create=False):
@@ -26,7 +28,19 @@ class DPDFS(LoggingMixIn, Operations):
     self.rpc_port = random.randint(10000, 20000)
     self.hg_port = random.randint(10000, 20000)
     self.peers = {}
+    self.bt_handles = {}
     self.should_push = False
+    
+    bt_start_port = random.randint(10000, 20000)
+    self.bt_session = lt.session()
+    self.bt_session.listen_on(bt_start_port, bt_start_port+10)
+    self.bt_port = self.bt_session.listen_port()
+    self.bt_session.start_lsd()
+    self.bt_session.start_dht()
+    print 'libtorrent listening on:', self.bt_port
+    self.bt_session.add_dht_router('localhost', 10670)
+    time.sleep(1)
+    print '...is_dht_running()', self.bt_session.dht_state()
     
     t = threading.Thread(target=self.__start_listening_bonjour)
     t.daemon = True
@@ -88,7 +102,72 @@ class DPDFS(LoggingMixIn, Operations):
     t.daemon = True
     t.start()
 
+    t = threading.Thread(target=self.__load_local_torrents)
+    t.daemon = True
+    t.start()
 
+    t = threading.Thread(target=self.__monitor)
+    t.daemon = True
+    t.start()
+
+
+  def __monitor(self):
+    while True:
+      #print '='*80
+      for path, h in self.bt_handles.iteritems():
+        s = h.status()
+        #if s.state==5 and s.download_rate==0 and s.upload_rate==0: continue
+        state_str = ['queued', 'checking', 'downloading metadata', 'downloading', 'finished', 'seeding', 'allocating']
+        print path, 'is %.2f%% complete (down: %.1f kb/s up: %.1f kB/s peers: %d) %s' % \
+            (s.progress * 100, s.download_rate / 1000, s.upload_rate / 1000, \
+            s.num_peers, state_str[s.state])
+      time.sleep(3)
+        
+        
+
+  
+  def __load_local_torrents(self):
+    #print 'self.hgdb', self.hgdb
+    for root, dirs, files in os.walk(self.hgdb):
+      #print 'root, dirs, files', root, dirs, files
+      if root.startswith(os.path.join(self.hgdb, '.hg')): continue
+      for fn in files:
+        if fn=='.__dpdfs_dir__': continue
+        fn = os.path.join(root, fn)
+        #print 'checking', fn
+        e = get_torrent_dict(fn)
+        #with open(fn,'rb') as f:
+        #  e = lt.bdecode(f.read())
+        if True:
+          uid = e['info']['name']
+          info = lt.torrent_info(e)
+          dat_file = os.path.join(self.dat, uid[:2], uid)
+          #print 'dat_file', dat_file
+          if os.path.isfile(dat_file):
+            if not os.path.isdir(os.path.dirname(dat_file)): os.mkdir(os.path.dirname(dat_file))
+            h = self.bt_session.add_torrent({'ti':info, 'save_path':os.path.join(self.dat, uid[:2])})
+            #h = self.bt_session.add_torrent(info, os.path.join(self.dat, uid[:2]), storage_mode=lt.storage_mode_t.storage_mode_sparse)
+            print 'added ', fn, '(%s)'%uid
+            self.bt_handles[fn[len(self.hgdb):]] = h
+    print 'self.bt_handles', self.bt_handles
+
+
+  def __add_torrent_and_wait(self, path, t):
+    uid = t['info']['name']
+    info = lt.torrent_info(t)
+    dat_file = os.path.join(self.dat, uid[:2], uid)
+    if not os.path.isdir(os.path.dirname(dat_file)): os.mkdir(os.path.dirname(dat_file))
+    h = self.bt_session.add_torrent({'ti':info, 'save_path':os.path.join(self.dat, uid[:2])})
+    for peer in self.peers.values():
+      print 'adding peer:', (peer.addr, peer.port)
+      h.connect_peer(('127.0.0.1', peer.bt_port), 0)
+    print 'added ', path
+    self.bt_handles[path] = h
+    while not h.is_seed():
+      time.sleep(1)
+    print 'done downloading'
+
+ 
   def __add_push_allow(self):
     pass
     #with open(os.path.join(self.hgdb, '.hg', 'hgrc'), 'a') as f:
@@ -159,6 +238,9 @@ class DPDFS(LoggingMixIn, Operations):
   def get_hg_port(self):
     return self.hg_port
     
+  def get_bt_port(self):
+    return self.bt_port
+    
   def you_should_pull_from(self, peer_name):
     if peer_name in self.peers:
       apeer = self.peers[peer_name]
@@ -173,6 +255,7 @@ class DPDFS(LoggingMixIn, Operations):
 
     server = jsonrpc.Server(jsonrpc.JsonRpc20(), jsonrpc.TransportTcpIp(addr=('', self.rpc_port), logfunc=jsonrpc.log_file("myrpc.%i.log"%self.rpc_port)))
     server.register_function(self.get_hg_port)
+    server.register_function(self.get_bt_port)
     server.register_function(self.you_should_pull_from)
     t = threading.Thread(target=server.serve)
     t.daemon = True
@@ -279,7 +362,10 @@ class DPDFS(LoggingMixIn, Operations):
         t = get_torrent_dict(fn)
         if t:
           name = t['info']['name']
-          return os.open(os.path.join(self.dat, name[:2], name), flags)
+          dat_fn = os.path.join(self.dat, name[:2], name)
+          if not os.path.isfile(dat_fn):
+            self.__add_torrent_and_wait(path, t)
+          return os.open(dat_fn, flags)
         else:
           return os.open(fn, flags)
       tmp = uuid.uuid4().hex
