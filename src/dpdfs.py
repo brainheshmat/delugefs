@@ -29,6 +29,7 @@ class DPDFS(LoggingMixIn, Operations):
     self.hg_port = random.randint(10000, 20000)
     self.peers = {}
     self.bt_handles = {}
+    self.bt_in_progress = set()
     self.should_push = False
     
     bt_start_port = random.randint(10000, 20000)
@@ -59,7 +60,6 @@ class DPDFS(LoggingMixIn, Operations):
         with open(vfn,'w') as f:
           f.write(self.name)
         self.repo.hg_init()
-        self.__add_push_allow()
       else:
         for i in range(30):
           if self.peers:
@@ -156,14 +156,16 @@ class DPDFS(LoggingMixIn, Operations):
     dat_file = os.path.join(self.dat, uid[:2], uid)
     if not os.path.isdir(os.path.dirname(dat_file)): os.mkdir(os.path.dirname(dat_file))
     h = self.bt_session.add_torrent({'ti':info, 'save_path':os.path.join(self.dat, uid[:2])})
+    #h.set_sequential_download(True)
     for peer in self.peers.values():
       print 'adding peer:', (peer.addr, peer.port)
       h.connect_peer(('127.0.0.1', peer.bt_port), 0)
     print 'added ', path
     self.bt_handles[path] = h
-    while not h.is_seed():
-      time.sleep(1)
-    print 'done downloading'
+    self.bt_in_progress.add(path)
+    while not os.path.isfile(dat_file):
+      time.sleep(.1)
+    print 'file created'
 
  
   def __keep_pushing(self):
@@ -345,6 +347,24 @@ class DPDFS(LoggingMixIn, Operations):
 
   def read(self, path, size, offset, fh):
     with self.rwlock:
+      print 'path in self.bt_in_progress', path in self.bt_in_progress
+      if path in self.bt_in_progress:
+        print '.. in progress'
+        h = self.bt_handles[path]
+        torrent_info = h.get_torrent_info()
+        piece_length = torrent_info.piece_length()
+        num_pieces = torrent_info.num_pieces()
+        start_index = offset // piece_length
+        end_index = (offset+size) // piece_length
+        print 'pieces', start_index, end_index
+        #for i in range(start_index, end_index+1):
+        #  h.piece_priority(i, 8)
+        #print 'piece_priorities set'
+        for i in range(start_index, min(end_index+1,num_pieces)):
+          print 'waiting for', i
+          while not h.have_piece(i):
+            time.sleep(1)
+          print 'we have', i
       os.lseek(fh, offset, 0)
       return os.read(fh, size)
 
