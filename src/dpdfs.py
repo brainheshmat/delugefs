@@ -74,7 +74,6 @@ class DPDFS(LoggingMixIn, Operations):
           #server = jsonrpc.ServerProxy(jsonrpc.JsonRpc20(), jsonrpc.TransportTcpIp(addr=addr))
           #remote_hg_port = apeer.server.get_hg_port()
           self.repo.hg_init()
-          self.__add_push_allow()
           self.repo.hg_pull('http://%s:%i' % (apeer.host, apeer.hg_port))
           with open(vfn,'w') as f:
             f.write(self.name)
@@ -120,7 +119,7 @@ class DPDFS(LoggingMixIn, Operations):
         state_str = ['queued', 'checking', 'downloading metadata', 'downloading', 'finished', 'seeding', 'allocating']
         print path, 'is %.2f%% complete (down: %.1f kb/s up: %.1f kB/s peers: %d) %s' % \
             (s.progress * 100, s.download_rate / 1000, s.upload_rate / 1000, \
-            s.num_peers, state_str[s.state])
+            s.num_peers, "")
       time.sleep(3)
         
         
@@ -138,17 +137,16 @@ class DPDFS(LoggingMixIn, Operations):
         e = get_torrent_dict(fn)
         #with open(fn,'rb') as f:
         #  e = lt.bdecode(f.read())
-        if True:
-          uid = e['info']['name']
-          info = lt.torrent_info(e)
-          dat_file = os.path.join(self.dat, uid[:2], uid)
-          #print 'dat_file', dat_file
-          if os.path.isfile(dat_file):
-            if not os.path.isdir(os.path.dirname(dat_file)): os.mkdir(os.path.dirname(dat_file))
-            h = self.bt_session.add_torrent({'ti':info, 'save_path':os.path.join(self.dat, uid[:2])})
-            #h = self.bt_session.add_torrent(info, os.path.join(self.dat, uid[:2]), storage_mode=lt.storage_mode_t.storage_mode_sparse)
-            print 'added ', fn, '(%s)'%uid
-            self.bt_handles[fn[len(self.hgdb):]] = h
+        uid = e['info']['name']
+        info = lt.torrent_info(e)
+        dat_file = os.path.join(self.dat, uid[:2], uid)
+        #print 'dat_file', dat_file
+        if os.path.isfile(dat_file):
+          if not os.path.isdir(os.path.dirname(dat_file)): os.mkdir(os.path.dirname(dat_file))
+          h = self.bt_session.add_torrent({'ti':info, 'save_path':os.path.join(self.dat, uid[:2])})
+          #h = self.bt_session.add_torrent(info, os.path.join(self.dat, uid[:2]), storage_mode=lt.storage_mode_t.storage_mode_sparse)
+          print 'added ', fn, '(%s)'%uid
+          self.bt_handles[fn[len(self.hgdb):]] = h
     print 'self.bt_handles', self.bt_handles
 
 
@@ -168,12 +166,6 @@ class DPDFS(LoggingMixIn, Operations):
     print 'done downloading'
 
  
-  def __add_push_allow(self):
-    pass
-    #with open(os.path.join(self.hgdb, '.hg', 'hgrc'), 'a') as f:
-    #  f.write("\n[web]\npush_ssl = false\n")
-
-
   def __keep_pushing(self):
     while True:
       if self.should_push:
@@ -321,7 +313,9 @@ class DPDFS(LoggingMixIn, Operations):
       fn = self.hgdb+path
       if os.path.isfile(fn):
         with open(fn, 'rb') as f:
-          st_size = lt.bdecode(f.read())['info']['length']
+          torrent = lt.bdecode(f.read())
+          torrent_info = torrent.get('info')  if torrent else None
+          st_size = torrent_info.get('length') if torrent_info else 0
     st = os.lstat(fn)
     ret = dict((key, getattr(st, key)) for key in ('st_atime', 'st_ctime',
             'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid'))
@@ -424,9 +418,22 @@ class DPDFS(LoggingMixIn, Operations):
       #print 'committing', self.hgdb+path
       self.repo.hg_commit('wrote %s' % path, files=[self.hgdb+path])
       self.should_push = True
+      self.__add_torrent(tdata, path)
     except Exception as e:
       traceback.print_exc()
       raise e
+      
+  def __add_torrent(self, torrent, path):
+    uid = torrent['info']['name']
+    info = lt.torrent_info(torrent)
+    dat_file = os.path.join(self.dat, uid[:2], uid)
+    #print 'dat_file', dat_file
+    if not os.path.isdir(os.path.dirname(dat_file)): os.mkdir(os.path.dirname(dat_file))
+    h = self.bt_session.add_torrent({'ti':info, 'save_path':os.path.join(self.dat, uid[:2])})
+    #h = self.bt_session.add_torrent(info, os.path.join(self.dat, uid[:2]), storage_mode=lt.storage_mode_t.storage_mode_sparse)
+    print 'added', uid
+    self.bt_handles[path] = h
+
     
   def rename(self, old, new):
     with self.rwlock:
