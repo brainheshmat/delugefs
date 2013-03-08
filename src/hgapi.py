@@ -85,8 +85,19 @@ class Repo(object):
         self.hg_command("serve", '-p', str(port))
 
     def hg_pull(self, url):
-        """Initialize a new repo"""
+        """pull from another repo"""
         self.hg_command("pull", str(url))
+
+    def hg_clone(self, url):
+        """clone a new repo"""
+        proc = Popen(["hg", "--encoding", "UTF-8", "clone", url, self.path], stdout=PIPE, stderr=PIPE, env=self._env)
+        out, err = [x.decode("utf-8") for x in  proc.communicate()]
+        if proc.returncode:
+            cmd = (" ".join(["hg", "--cwd", self.path] + list(args)))
+            print(cmd)
+            raise Exception("Error running %s:\n\tErr: %s\n\tOut: %s\n\tExit: %s" 
+                            % (cmd,err,out,proc.returncode))
+        return out
 
     def hg_push(self, url):
         """Initialize a new repo"""

@@ -1,11 +1,12 @@
 #!/usr/bin/env python
 
-import os, errno, sys, threading, collections, uuid, shutil, traceback, random, select, threading, time, socket
+import os, errno, sys, threading, collections, uuid, shutil, traceback, random, select, threading, time, socket, multiprocessing
 from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
 import libtorrent as lt
 import hgapi as hg
 import pybonjour
 import jsonrpc
+
 
 class Peer(object):
   def __init__(self, service_name, host, port):
@@ -32,6 +33,9 @@ class DPDFS(LoggingMixIn, Operations):
     self.bt_in_progress = set()
     self.should_push = False
     
+    if not os.path.isdir(self.root):
+      os.mkdir(self.root)
+    
     bt_start_port = random.randint(10000, 20000)
     self.bt_session = lt.session()
     self.bt_session.listen_on(bt_start_port, bt_start_port+10)
@@ -47,7 +51,6 @@ class DPDFS(LoggingMixIn, Operations):
     t.daemon = True
     t.start()
     
-    if not os.path.isdir(self.hgdb): os.makedirs(self.hgdb)
     self.repo = hg.Repo(self.hgdb)
     vfn = os.path.join(self.root, '__volume__')
     if os.path.isfile(vfn):
@@ -57,6 +60,7 @@ class DPDFS(LoggingMixIn, Operations):
           raise Exception('volume name "%s" != existing volume name "%s"' % (self.name, existing_name))
     else:
       if create:
+        if not os.path.isdir(self.hgdb): os.mkdir(self.hgdb)
         with open(vfn,'w') as f:
           f.write(self.name)
         self.repo.hg_init()
@@ -73,8 +77,9 @@ class DPDFS(LoggingMixIn, Operations):
           apeer = self.peers[iter(self.peers).next()]
           #server = jsonrpc.ServerProxy(jsonrpc.JsonRpc20(), jsonrpc.TransportTcpIp(addr=addr))
           #remote_hg_port = apeer.server.get_hg_port()
-          self.repo.hg_init()
-          self.repo.hg_pull('http://%s:%i' % (apeer.host, apeer.hg_port))
+          if not os.path.isdir(self.hgdb): os.mkdir(self.hgdb)
+          #self.repo.hg_init()
+          self.repo.hg_clone('http://%s:%i' % (apeer.host, apeer.hg_port))
           with open(vfn,'w') as f:
             f.write(self.name)
           self.repo.hg_update('tip')
@@ -357,7 +362,7 @@ class DPDFS(LoggingMixIn, Operations):
         start_index = offset // piece_length
         end_index = (offset+size) // piece_length
         print 'pieces', start_index, end_index
-        #for i in range(start_index, end_index+1):
+        #for i in range(start_index, min(end_index+1,num_pieces)):
         #  h.piece_priority(i, 8)
         #print 'piece_priorities set'
         for i in range(start_index, min(end_index+1,num_pieces)):
@@ -513,14 +518,38 @@ resolved = []
 
 
 
+def usage(msg):
+  print 'ERROR:', msg
+  print('usage: %s [--create] --id <id> --root <root> [--mount <mountpoint>]' % sys.argv[0])
+  print '  id: any string'
+  print '  root: path to backend storage to use'
+  print '  mount: path to FUSE mount location'
+  sys.exit(1)
 
 
 if __name__ == '__main__':
-  create = '--create' in sys.argv
-  args = [x for x in sys.argv if not x.startswith('-')]
-  if len(args) != 4:
-    print('usage: %s [--create] <name> <root> <mountpoint>' % sys.argv[0])
-    sys.exit(1)
 
-  fuse = FUSE(DPDFS(args[1], args[2], create=create), args[3], foreground=True)
+  config = {}
+  k = None
+  for s in sys.argv:
+    if s.startswith('--'):
+      if k:  config[k] = True
+      k = s[2:]
+    else:
+      if k:
+        config[k] = s
+        k = None
+        
+  if not 'id' in config:
+    usage('id not set')
+  if not 'root' in config:
+    usage('root not set')
+  
+
+  server = DPDFS(config['id'], config['root'], create=config.get('create'))
+  if 'mount' in config:
+    fuse = FUSE(server, config['mount'], foreground=True)
+  else:
+    while True:
+      time.sleep(60)
 
