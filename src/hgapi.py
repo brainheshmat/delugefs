@@ -93,7 +93,7 @@ class Repo(object):
         proc = Popen(["hg", "--encoding", "UTF-8", "clone", url, self.path], stdout=PIPE, stderr=PIPE, env=self._env)
         out, err = [x.decode("utf-8") for x in  proc.communicate()]
         if proc.returncode:
-            cmd = (" ".join(["hg", "--cwd", self.path] + list(args)))
+            cmd = (" ".join(["hg", "clone", url, self.path]))
             print(cmd)
             raise Exception("Error running %s:\n\tErr: %s\n\tOut: %s\n\tExit: %s" 
                             % (cmd,err,out,proc.returncode))

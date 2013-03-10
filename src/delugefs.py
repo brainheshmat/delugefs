@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-import os, errno, sys, threading, collections, uuid, shutil, traceback, random, select, threading, time, socket, multiprocessing
+import os, errno, sys, threading, collections, uuid, shutil, traceback, random, select, threading, time, socket, multiprocessing, stat
 from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
 import libtorrent as lt
 import hgapi as hg
@@ -44,53 +44,49 @@ class DPDFS(LoggingMixIn, Operations):
     self.bt_session.start_dht()
     print 'libtorrent listening on:', self.bt_port
     self.bt_session.add_dht_router('localhost', 10670)
-    time.sleep(1)
     print '...is_dht_running()', self.bt_session.dht_state()
     
     t = threading.Thread(target=self.__start_listening_bonjour)
     t.daemon = True
     t.start()
+    print 'give me a sec to look for other peers...'
+    time.sleep(2)
     
     self.repo = hg.Repo(self.hgdb)
-    vfn = os.path.join(self.root, '__volume__')
-    if os.path.isfile(vfn):
-      with open(vfn,'r') as f:
-        existing_name = f.read().strip()
-        if self.name != existing_name:
-          raise Exception('volume name "%s" != existing volume name "%s"' % (self.name, existing_name))
+    if create:
+      if os.listdir(self.root):
+        raise Exception('--create specified, but %s is not empty' % self.root)
+      if self.peers:
+        raise Exception('--create specified, but i found %i peer%s using --id "%s" already' % (len(self.peers), 's' if len(self.peers)>1 else '', self.name))
+      self.repo.hg_init()
+      os.mkdir(os.path.join(self.hgdb, '.__delugefs__'))
+      with open(os.path.join(self.hgdb, '.__delugefs__', 'cluster_name'), 'w') as f:
+        f.write(self.name)
     else:
-      if create:
-        if not os.path.isdir(self.hgdb): os.mkdir(self.hgdb)
-        with open(vfn,'w') as f:
-          f.write(self.name)
-        self.repo.hg_init()
+      cnfn = os.path.join(self.hgdb, '.__delugefs__', 'cluster_name')
+      if os.path.isfile(cnfn):
+        with open(cnfn, 'r') as f:
+          existing_cluster_name = f.read().strip()
+          if existing_cluster_name != self.name:
+            raise Exception('a cluster root exists at %s, but its name is "%s", not "%s"' % (self.root, existing_cluster_name, self.name))
       else:
-        for i in range(30):
-          if self.peers:
-            print 'found peer!', self.peers
-            break
-          time.sleep(1)
+        if os.listdir(self.root):
+          raise Exception('root %s is not empty, but no cluster was found' % self.root)
         if not self.peers:
-          raise Exception('--create not specified, no repo exists and no peers found')
-        
+          raise Exception('--create not specified, no repo exists at %s and no peers of cluster "%s" found' % (self.root, self.name))
         try:
           apeer = self.peers[iter(self.peers).next()]
           #server = jsonrpc.ServerProxy(jsonrpc.JsonRpc20(), jsonrpc.TransportTcpIp(addr=addr))
           #remote_hg_port = apeer.server.get_hg_port()
           if not os.path.isdir(self.hgdb): os.mkdir(self.hgdb)
-          #self.repo.hg_init()
           self.repo.hg_clone('http://%s:%i' % (apeer.host, apeer.hg_port))
-          with open(vfn,'w') as f:
-            f.write(self.name)
-          self.repo.hg_update('tip')
         except Exception as e:
           if os.path.isdir(os.path.join(self.hgdb, '.hg')):
-            shutil.rmtree(os.path.join(self.hgdb, '.hg'))
+            shutil.rmtree(self.hgdb)
           traceback.print_exc()
           raise e
         print 'success cloning repo!'
-        
-    
+      
     if not os.path.isdir(self.tmp): os.makedirs(self.tmp)
     for fn in os.listdir(self.tmp): os.remove(os.path.join(self.tmp,fn))
     if not os.path.isdir(self.dat): os.makedirs(self.dat)
@@ -135,10 +131,11 @@ class DPDFS(LoggingMixIn, Operations):
     for root, dirs, files in os.walk(self.hgdb):
       #print 'root, dirs, files', root, dirs, files
       if root.startswith(os.path.join(self.hgdb, '.hg')): continue
+      if root.startswith(os.path.join(self.hgdb, '.__delugefs__')): continue
       for fn in files:
         if fn=='.__dpdfs_dir__': continue
         fn = os.path.join(root, fn)
-        #print 'checking', fn
+        print 'loading torrent', fn
         e = get_torrent_dict(fn)
         #with open(fn,'rb') as f:
         #  e = lt.bdecode(f.read())
@@ -297,6 +294,7 @@ class DPDFS(LoggingMixIn, Operations):
 
   def create(self, path, mode):
     with self.rwlock:
+      if path.startswith('/.__delugefs__'): return 0
       tmp = uuid.uuid4().hex
       self.open_files[path] = tmp
       with open(self.hgdb+path,'wb') as f:
@@ -319,13 +317,18 @@ class DPDFS(LoggingMixIn, Operations):
     else:
       fn = self.hgdb+path
       if os.path.isfile(fn):
-        with open(fn, 'rb') as f:
-          torrent = lt.bdecode(f.read())
-          torrent_info = torrent.get('info')  if torrent else None
-          st_size = torrent_info.get('length') if torrent_info else 0
+        if not path.startswith('/.__delugefs__'):
+          with open(fn, 'rb') as f:
+            torrent = lt.bdecode(f.read())
+            torrent_info = torrent.get('info')  if torrent else None
+            st_size = torrent_info.get('length') if torrent_info else 0
     st = os.lstat(fn)
     ret = dict((key, getattr(st, key)) for key in ('st_atime', 'st_ctime',
             'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid'))
+    print 'ret', ret
+    if path.startswith('/.__delugefs__'):
+      ret['st_mode'] = ret['st_mode'] & ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
+    print 'ret', ret
     if st_size is not None:
       ret['st_size'] = st_size
     return ret
@@ -334,6 +337,7 @@ class DPDFS(LoggingMixIn, Operations):
   
   def link(self, target, source):
     with self.rwlock:
+      if path.startswith('/.__delugefs__'): return 0
       return os.link(source, target)
 
   listxattr = None
@@ -341,6 +345,7 @@ class DPDFS(LoggingMixIn, Operations):
 
   def mkdir(self, path, flags):
     with self.rwlock:
+      if path.startswith('/.__delugefs__'): return 0
       fn = self.hgdb+path
       ret = os.mkdir(fn, flags)
       with open(fn+'/.__dpdfs_dir__','w') as f:
@@ -371,12 +376,16 @@ class DPDFS(LoggingMixIn, Operations):
             time.sleep(1)
           print 'we have', i
       os.lseek(fh, offset, 0)
-      return os.read(fh, size)
+      ret = os.read(fh, size)
+      #print 'ret', ret
+      return ret
 
   def open(self, path, flags):
     with self.rwlock:
       fn = self.hgdb+path
       if not (flags & (os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_EXCL | os.O_TRUNC)):
+        if path.startswith('/.__delugefs__'):
+          return os.open(fn, flags)
         #print '\treadonly'
         t = get_torrent_dict(fn)
         if t:
@@ -387,6 +396,7 @@ class DPDFS(LoggingMixIn, Operations):
           return os.open(dat_fn, flags)
         else:
           return os.open(fn, flags)
+      if path.startswith('/.__delugefs__'): return 0
       tmp = uuid.uuid4().hex
       if os.path.isfile(fn):
         with open(fn, 'rb') as f:
@@ -408,6 +418,7 @@ class DPDFS(LoggingMixIn, Operations):
   def release(self, path, fh):
     with self.rwlock:
       ret = os.close(fh)
+      print 'ret', ret, path
       if path in self.open_files:
         self.finalize(path, self.open_files[path])
         del self.open_files[path]
@@ -462,6 +473,8 @@ class DPDFS(LoggingMixIn, Operations):
     
   def rename(self, old, new):
     with self.rwlock:
+      if old.startswith('/.__delugefs__'): return 0
+      if new.startswith('/.__delugefs__'): return 0
       self.repo.hg_rename(self.hgdb+old, self.hgdb+new)
       self.repo.hg_commit('rename %s to %s' % (old,new), files=[self.hgdb+old, self.hgdb+new])
       self.should_push = True
@@ -470,6 +483,7 @@ class DPDFS(LoggingMixIn, Operations):
 
   def rmdir(self, path):
     with self.rwlock:
+      if path.startswith('/.__delugefs__'): return 0
       self.repo.hg_remove(self.hgdb+path+'/.__dpdfs_dir__')
       self.repo.hg_commit('rmdir %s' % path, files=[self.hgdb+path+'/.__dpdfs_dir__'])
       self.should_push = True
@@ -483,12 +497,15 @@ class DPDFS(LoggingMixIn, Operations):
 
   def symlink(self, target, source):
     with self.rwlock:
+      if target.startswith('/.__delugefs__'): return 0
+      if src.startswith('/.__delugefs__'): return 0
       ret = os.symlink(source, target)
       return ret
         
 
   def truncate(self, path, length, fh=None):
     with self.rwlock:
+      if path.startswith('/.__delugefs__'): return 0
       with open(os.path.join(self.tmp, self.open_files[path]), 'r+') as f:
         f.truncate(length)
 
@@ -496,6 +513,7 @@ class DPDFS(LoggingMixIn, Operations):
 
   def unlink(self, path):
     with self.rwlock:
+      if path.startswith('/.__delugefs__'): return 0
       self.repo.hg_remove(self.hgdb+path)
       self.repo.hg_commit('unlink %s' % path, files=[self.hgdb+path])
       self.should_push = True
@@ -520,8 +538,8 @@ resolved = []
 
 def usage(msg):
   print 'ERROR:', msg
-  print('usage: %s [--create] --id <id> --root <root> [--mount <mountpoint>]' % sys.argv[0])
-  print '  id: any string'
+  print('usage: %s [--create] --cluster <clustername> --root <root> [--mount <mountpoint>]' % sys.argv[0])
+  print '  cluster: any string uniquely identifying the desired cluster'
   print '  root: path to backend storage to use'
   print '  mount: path to FUSE mount location'
   sys.exit(1)
@@ -540,13 +558,13 @@ if __name__ == '__main__':
         config[k] = s
         k = None
         
-  if not 'id' in config:
-    usage('id not set')
+  if not 'cluster' in config:
+    usage('cluster name not set')
   if not 'root' in config:
     usage('root not set')
   
 
-  server = DPDFS(config['id'], config['root'], create=config.get('create'))
+  server = DPDFS(config['cluster'], config['root'], create=config.get('create'))
   if 'mount' in config:
     fuse = FUSE(server, config['mount'], foreground=True)
   else:
