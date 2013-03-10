@@ -1,12 +1,14 @@
 #!/usr/bin/env python
 
-import os, errno, sys, threading, collections, uuid, shutil, traceback, random, select, threading, time, socket, multiprocessing, stat
+import os, errno, sys, threading, collections, uuid, shutil, traceback, random, select, threading, time, socket, multiprocessing, stat, datetime, statvfs
 from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
 import libtorrent as lt
 import hgapi as hg
 import pybonjour
 import jsonrpc
 
+
+SECONDS_TO_NEXT_CHECK = 120
 
 class Peer(object):
   def __init__(self, service_name, host, port):
@@ -32,6 +34,7 @@ class DelugeFS(LoggingMixIn, Operations):
     self.bt_handles = {}
     self.bt_in_progress = set()
     self.should_push = False
+    self.next_time_to_check_for_undermirrored_files = datetime.datetime.now() + datetime.timedelta(0,10+random.randint(0,30))
     
     if not os.path.isdir(self.root):
       os.mkdir(self.root)
@@ -114,15 +117,13 @@ class DelugeFS(LoggingMixIn, Operations):
     t.start()
 
 
-  def __monitor(self):
-    time.sleep(3)
-    while True:
-      #print '='*80
+  def __write_active_torrents(self):
+    try:
       with open(os.path.join(self.hgdb, '.__delugefs__', 'active_torrents'), 'w') as f:
         for path, h in self.bt_handles.items():
           s = h.status()
-          torrent_peers = h.get_peer_info()
-          print 'torrent_peers', torrent_peers
+#          torrent_peers = h.get_peer_info()
+#          print 'torrent_peers', torrent_peers
 #          if len(torrent_peers) < 1:
 #            print 'only', len(torrent_peers), 'peer for', path
 #            if self.peers:
@@ -133,7 +134,77 @@ class DelugeFS(LoggingMixIn, Operations):
           f.write('%s is %.2f%% complete (down: %.1f kb/s up: %.1f kB/s peers: %d) %s\n' % \
               (path, s.progress * 100, s.download_rate / 1000, s.upload_rate / 1000, \
               s.num_peers, ""))
-      time.sleep(3)
+    except Exception as e:
+      traceback.print_exc()
+  
+  def __check_for_undermirrored_files(self):
+    if self.next_time_to_check_for_undermirrored_files > datetime.datetime.now(): return
+    try:
+      print 'check_for_undermirrored_files @', datetime.datetime.now()
+      my_uids = set(self.get_active_info_hashes())
+      counter = collections.Counter(my_uids)
+      peer_free_space = {'__self__': self.get_free_space()}
+      uid_peers = collections.defaultdict(set)
+      for uid in my_uids:
+        uid_peers[uid].add('__self__')
+      for peer_id, peer in self.peers.items():
+        for s in peer.server.get_active_info_hashes():
+          counter[s] += 1
+          uid_peers[s].add(peer_id)
+        peer_free_space[peer_id] = peer.server.get_free_space()
+      print 'counter', counter
+      print 'peer_free_space', peer_free_space
+      if len(peer_free_space) < 2:
+        print "can't do anything, since i'm the only peer!"
+        return
+
+      for root, dirs, files in os.walk(self.hgdb):
+        #print 'root, dirs, files', root, dirs, files
+        if root.startswith(os.path.join(self.hgdb, '.hg')): continue
+        if root.startswith(os.path.join(self.hgdb, '.__delugefs__')): continue
+        for fn in files:
+          if fn=='.__delugefs_dir__': continue
+          fn = os.path.join(root, fn)
+          e = get_torrent_dict(fn)
+          uid = e['info']['name']
+          size = e['info']['length']
+          if counter[uid] < 2:
+            peer_free_space_list = sorted(peer_free_space.items(), lambda x,y: x[1]<y[1])
+            best_peer_id = peer_free_space_list[0][0]
+            if uid in my_uids and best_peer_id=='__self__':
+              best_peer_id = peer_free_space_list[1][0]
+            peer_free_space[best_peer_id] -= size
+            path = fn[len(self.hgdb):]
+            print 'need to rep', path, 'to', best_peer_id
+            if '__self__'==best_peer_id:
+              self.please_mirror(path)
+            else:
+              self.peers[best_peer_id].server.please_mirror(path)
+            print 'peer_free_space_list', peer_free_space_list
+          if counter[uid] > 2:
+            print 'uid_peers', uid_peers
+            peer_free_space_list = sorted([x for x in peer_free_space.items() if x[0] in uid_peers[uid]], lambda x,y: x[1]>y[1])
+            print 'peer_free_space_list2', peer_free_space_list
+            best_peer_id = peer_free_space_list[0][0]
+            if '__self__'==best_peer_id:
+              self.please_stop_mirroring(path)
+            else:
+              self.peers[best_peer_id].server.please_stop_mirroring(path)
+            print 'please_stop_mirroring', path, 'sent to', best_peer_id
+
+
+    except Exception as e:
+      traceback.print_exc()
+    self.next_time_to_check_for_undermirrored_files = datetime.datetime.now() + datetime.timedelta(0,SECONDS_TO_NEXT_CHECK+random.randint(0,30))
+    
+
+  def __monitor(self):
+    time.sleep(3)
+    while True:
+      #print '='*80
+      self.__write_active_torrents()
+      self.__check_for_undermirrored_files()
+      time.sleep(random.randint(3,7))
         
         
 
@@ -263,15 +334,38 @@ class DelugeFS(LoggingMixIn, Operations):
     fn = self.hgdb+path
     torrent = get_torrent_dict(fn)
     self.__add_torrent(torrent, path)
+    
+  def please_stop_mirroring(self, path):
+    print 'got please_stop_mirroring', path
+    
+   
+  def get_active_info_hashes(self):
+    self.next_time_to_check_for_undermirrored_files = datetime.datetime.now() + datetime.timedelta(0,SECONDS_TO_NEXT_CHECK+random.randint(0,30))
+    try:
+      active_info_hashes = []
+      for h in self.bt_handles.values():
+        active_info_hashes.append(str(h.get_torrent_info().name()))
+      print 'active_info_hashes', active_info_hashes
+      return active_info_hashes
+    except:
+      traceback.print_exc()
+      
+  def get_free_space(self):
+    f = os.statvfs(self.root)
+    return f[statvfs.F_BSIZE] * f[statvfs.F_BFREE]
   
   def __register(self):
     #return
 
-    server = jsonrpc.Server(jsonrpc.JsonRpc20(), jsonrpc.TransportTcpIp(addr=('', self.rpc_port), logfunc=jsonrpc.log_file("myrpc.%i.log"%self.rpc_port)))
+    server = jsonrpc.Server(jsonrpc.JsonRpc20(), jsonrpc.TransportTcpIp(addr=('', self.rpc_port))) #, logfunc=jsonrpc.log_file("myrpc.%i.log"%self.rpc_port)
     server.register_function(self.get_hg_port)
     server.register_function(self.get_bt_port)
     server.register_function(self.you_should_pull_from)
     server.register_function(self.please_mirror)
+    server.register_function(self.get_active_info_hashes)
+    server.register_function(self.get_free_space)
+    server.register_function(self.please_stop_mirroring)
+    
     
     t = threading.Thread(target=server.serve)
     t.daemon = True
