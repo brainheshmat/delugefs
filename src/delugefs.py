@@ -168,13 +168,13 @@ class DelugeFS(LoggingMixIn, Operations):
           e = get_torrent_dict(fn)
           uid = e['info']['name']
           size = e['info']['length']
+          path = fn[len(self.hgdb):]
           if counter[uid] < 2:
             peer_free_space_list = sorted(peer_free_space.items(), lambda x,y: x[1]<y[1])
             best_peer_id = peer_free_space_list[0][0]
             if uid in my_uids and best_peer_id=='__self__':
               best_peer_id = peer_free_space_list[1][0]
             peer_free_space[best_peer_id] -= size
-            path = fn[len(self.hgdb):]
             print 'need to rep', path, 'to', best_peer_id
             if '__self__'==best_peer_id:
               self.please_mirror(path)
