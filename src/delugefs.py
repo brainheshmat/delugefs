@@ -18,7 +18,7 @@ class Peer(object):
     self.hg_port = self.server.get_hg_port()
     self.bt_port = self.server.get_bt_port()
 
-class DPDFS(LoggingMixIn, Operations):
+class DelugeFS(LoggingMixIn, Operations):
   def __init__(self, name, root, create=False):
     self.name = name
     self.root = os.path.realpath(root)
@@ -53,17 +53,20 @@ class DPDFS(LoggingMixIn, Operations):
     time.sleep(2)
     
     self.repo = hg.Repo(self.hgdb)
+    cnfn = os.path.join(self.hgdb, '.__delugefs__', 'cluster_name')
     if create:
       if os.listdir(self.root):
         raise Exception('--create specified, but %s is not empty' % self.root)
       if self.peers:
         raise Exception('--create specified, but i found %i peer%s using --id "%s" already' % (len(self.peers), 's' if len(self.peers)>1 else '', self.name))
+      os.mkdir(self.hgdb)
       self.repo.hg_init()
       os.mkdir(os.path.join(self.hgdb, '.__delugefs__'))
-      with open(os.path.join(self.hgdb, '.__delugefs__', 'cluster_name'), 'w') as f:
+      with open(cnfn, 'w') as f:
         f.write(self.name)
+      self.repo.hg_add(cnfn)
+      self.repo.hg_commit(cnfn)
     else:
-      cnfn = os.path.join(self.hgdb, '.__delugefs__', 'cluster_name')
       if os.path.isfile(cnfn):
         with open(cnfn, 'r') as f:
           existing_cluster_name = f.read().strip()
@@ -112,15 +115,24 @@ class DPDFS(LoggingMixIn, Operations):
 
 
   def __monitor(self):
+    time.sleep(3)
     while True:
       #print '='*80
-      for path, h in self.bt_handles.iteritems():
-        s = h.status()
-        #if s.state==5 and s.download_rate==0 and s.upload_rate==0: continue
-        state_str = ['queued', 'checking', 'downloading metadata', 'downloading', 'finished', 'seeding', 'allocating']
-        print path, 'is %.2f%% complete (down: %.1f kb/s up: %.1f kB/s peers: %d) %s' % \
-            (s.progress * 100, s.download_rate / 1000, s.upload_rate / 1000, \
-            s.num_peers, "")
+      with open(os.path.join(self.hgdb, '.__delugefs__', 'active_torrents'), 'w') as f:
+        for path, h in self.bt_handles.items():
+          s = h.status()
+          torrent_peers = h.get_peer_info()
+          print 'torrent_peers', torrent_peers
+#          if len(torrent_peers) < 1:
+#            print 'only', len(torrent_peers), 'peer for', path
+#            if self.peers:
+#              peer = self.peers.values()[random.randint(0,len(self.peers)-1)]
+#              peer.server.please_mirror(path)
+          #if s.state==5 and s.download_rate==0 and s.upload_rate==0: continue
+          state_str = ['queued', 'checking', 'downloading metadata', 'downloading', 'finished', 'seeding', 'allocating']
+          f.write('%s is %.2f%% complete (down: %.1f kb/s up: %.1f kB/s peers: %d) %s\n' % \
+              (path, s.progress * 100, s.download_rate / 1000, s.upload_rate / 1000, \
+              s.num_peers, ""))
       time.sleep(3)
         
         
@@ -133,7 +145,7 @@ class DPDFS(LoggingMixIn, Operations):
       if root.startswith(os.path.join(self.hgdb, '.hg')): continue
       if root.startswith(os.path.join(self.hgdb, '.__delugefs__')): continue
       for fn in files:
-        if fn=='.__dpdfs_dir__': continue
+        if fn=='.__delugefs_dir__': continue
         fn = os.path.join(root, fn)
         print 'loading torrent', fn
         e = get_torrent_dict(fn)
@@ -180,7 +192,7 @@ class DPDFS(LoggingMixIn, Operations):
       time.sleep(10)
 
   def __start_listening_bonjour(self):
-    browse_sdRef = pybonjour.DNSServiceBrowse(regtype="_dpdfs._tcp", callBack=self.__bonjour_browse_callback)
+    browse_sdRef = pybonjour.DNSServiceBrowse(regtype="_delugefs._tcp", callBack=self.__bonjour_browse_callback)
     try:
       try:
         while True:
@@ -221,7 +233,7 @@ class DPDFS(LoggingMixIn, Operations):
       if port==self.rpc_port:
         #print 'ignoring my own service'
         return
-      if not (fullname.startswith(self.name+'__') and '._dpdfs._tcp.' in fullname):
+      if not (fullname.startswith(self.name+'__') and '._delugefs._tcp.' in fullname):
         #print 'ignoring unrelated service', fullname
         return
       #print 'resolve_callback', sdRef, flags, interfaceIndex, errorCode, fullname, hosttarget, port, txtRecord
@@ -245,6 +257,12 @@ class DPDFS(LoggingMixIn, Operations):
       return 'i updated, thanks!'
     else:
       return "i don't know you, "+ peer_name
+      
+  def please_mirror(self, path):
+    print 'please_mirror', path
+    fn = self.hgdb+path
+    torrent = get_torrent_dict(fn)
+    self.__add_torrent(torrent, path)
   
   def __register(self):
     #return
@@ -253,6 +271,8 @@ class DPDFS(LoggingMixIn, Operations):
     server.register_function(self.get_hg_port)
     server.register_function(self.get_bt_port)
     server.register_function(self.you_should_pull_from)
+    server.register_function(self.please_mirror)
+    
     t = threading.Thread(target=server.serve)
     t.daemon = True
     t.start()
@@ -265,7 +285,7 @@ class DPDFS(LoggingMixIn, Operations):
     
     print 'registering bonjour listener...'
     self.bj_name = self.name+'__'+uuid.uuid4().hex
-    bjservice = pybonjour.DNSServiceRegister(name=self.bj_name, regtype="_dpdfs._tcp", 
+    bjservice = pybonjour.DNSServiceRegister(name=self.bj_name, regtype="_delugefs._tcp", 
                                              port=self.rpc_port, callBack=self.__bonjour_register_callback)
     try:
       while True:
@@ -282,8 +302,8 @@ class DPDFS(LoggingMixIn, Operations):
   def __call__(self, op, path, *args):
     print op, path, ('...data...' if op=='write' else args)
     if path.startswith('/.Trash'): raise FuseOSError(errno.EACCES)
-    if path.endswith('/.__dpdfs_dir__'): raise FuseOSError(errno.EACCES)
-    return super(DPDFS, self).__call__(op, path, *args)
+    if path.endswith('/.__delugefs_dir__'): raise FuseOSError(errno.EACCES)
+    return super(DelugeFS, self).__call__(op, path, *args)
 
   def access(self, path, mode):
     if not os.access(self.hgdb+path, mode):
@@ -325,10 +345,8 @@ class DPDFS(LoggingMixIn, Operations):
     st = os.lstat(fn)
     ret = dict((key, getattr(st, key)) for key in ('st_atime', 'st_ctime',
             'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid'))
-    print 'ret', ret
     if path.startswith('/.__delugefs__'):
       ret['st_mode'] = ret['st_mode'] & ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
-    print 'ret', ret
     if st_size is not None:
       ret['st_size'] = st_size
     return ret
@@ -348,10 +366,10 @@ class DPDFS(LoggingMixIn, Operations):
       if path.startswith('/.__delugefs__'): return 0
       fn = self.hgdb+path
       ret = os.mkdir(fn, flags)
-      with open(fn+'/.__dpdfs_dir__','w') as f:
+      with open(fn+'/.__delugefs_dir__','w') as f:
         f.write("hg doesn't track empty dirs, so we add this file...")
-      self.repo.hg_add(fn+'/.__dpdfs_dir__')
-      self.repo.hg_commit('mkdir %s' % path, files=[fn+'/.__dpdfs_dir__'])
+      self.repo.hg_add(fn+'/.__delugefs_dir__')
+      self.repo.hg_commit('mkdir %s' % path, files=[fn+'/.__delugefs_dir__'])
       self.should_push = True
       return ret
 
@@ -367,7 +385,12 @@ class DPDFS(LoggingMixIn, Operations):
         start_index = offset // piece_length
         end_index = (offset+size) // piece_length
         print 'pieces', start_index, end_index
-        #for i in range(start_index, min(end_index+1,num_pieces)):
+        priorities = h.piece_priorities()
+        print 'priorities', priorities
+        for i in range(start_index, min(end_index+1,num_pieces)):
+          priorities[i] = 7
+        h.prioritize_pieces(priorities)
+        print 'priorities', priorities
         #  h.piece_priority(i, 8)
         #print 'piece_priorities set'
         for i in range(start_index, min(end_index+1,num_pieces)):
@@ -411,7 +434,7 @@ class DPDFS(LoggingMixIn, Operations):
     
   def readdir(self, path, fh):
     with self.rwlock:
-      return ['.', '..'] + [x for x in os.listdir(self.hgdb+path) if x!=".__dpdfs_dir__" and x!='.hg']
+      return ['.', '..'] + [x for x in os.listdir(self.hgdb+path) if x!=".__delugefs_dir__" and x!='.hg']
 
 #    readlink = os.readlink
 
@@ -422,6 +445,10 @@ class DPDFS(LoggingMixIn, Operations):
       if path in self.open_files:
         self.finalize(path, self.open_files[path])
         del self.open_files[path]
+      if path in self.bt_in_progress:
+        h = self.bt_handles[path]
+        priorities = h.piece_priorities()
+        #h.prioritize_pieces([0 for x in priorities])
       return ret
     
   def finalize(self, path, uid):
@@ -437,7 +464,7 @@ class DPDFS(LoggingMixIn, Operations):
       #print tmp_fn, st_size
       lt.add_files(fs, tmp_fn, st_size)
       t = lt.create_torrent(fs)
-      #t.set_creator("dpdfs");
+      t.set_creator("DelugeFS");
       lt.set_piece_hashes(t, self.tmp)
       tdata = t.generate()
       #print tdata
@@ -484,8 +511,8 @@ class DPDFS(LoggingMixIn, Operations):
   def rmdir(self, path):
     with self.rwlock:
       if path.startswith('/.__delugefs__'): return 0
-      self.repo.hg_remove(self.hgdb+path+'/.__dpdfs_dir__')
-      self.repo.hg_commit('rmdir %s' % path, files=[self.hgdb+path+'/.__dpdfs_dir__'])
+      self.repo.hg_remove(self.hgdb+path+'/.__delugefs_dir__')
+      self.repo.hg_commit('rmdir %s' % path, files=[self.hgdb+path+'/.__delugefs_dir__'])
       self.should_push = True
       #return os.rmdir(self.hgdb+path)
 
@@ -514,6 +541,14 @@ class DPDFS(LoggingMixIn, Operations):
   def unlink(self, path):
     with self.rwlock:
       if path.startswith('/.__delugefs__'): return 0
+      with open(self.hgdb+path, 'rb') as f:
+        torrent = lt.bdecode(f.read())
+        torrent_info = torrent.get('info')  if torrent else None
+        name = torrent_info.get('name') if torrent_info else 0
+        dfn = os.path.join(self.dat, name[:2], name)
+        if os.path.isfile(dfn):
+          os.remove(dfn)
+          print 'deleted', dfn
       self.repo.hg_remove(self.hgdb+path)
       self.repo.hg_commit('unlink %s' % path, files=[self.hgdb+path])
       self.should_push = True
@@ -564,7 +599,7 @@ if __name__ == '__main__':
     usage('root not set')
   
 
-  server = DPDFS(config['cluster'], config['root'], create=config.get('create'))
+  server = DelugeFS(config['cluster'], config['root'], create=config.get('create'))
   if 'mount' in config:
     fuse = FUSE(server, config['mount'], foreground=True)
   else:
