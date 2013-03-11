@@ -350,7 +350,7 @@ class DelugeFS(LoggingMixIn, Operations):
         
     h = self.bt_handles[path]
     if h:
-      uid = h.get_torrent_info()['info']['name']
+      uid = h.get_torrent_info().name()
       self.bt_session.remove_torrent(h)
       os.remove(os.path.join(self.dat, uid[:2], uid))
       print 'stopped mirroring', path
