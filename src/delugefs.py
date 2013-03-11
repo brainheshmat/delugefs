@@ -343,10 +343,13 @@ class DelugeFS(LoggingMixIn, Operations):
       return "i don't know you, "+ peer_name
       
   def please_mirror(self, path):
-    print 'please_mirror', path
-    fn = self.hgdb+path
-    torrent = get_torrent_dict(fn)
-    self.__add_torrent(torrent, path)
+    try:
+      print 'please_mirror', path
+      fn = self.hgdb+path
+      torrent = get_torrent_dict(fn)
+      self.__add_torrent(torrent, path)
+    except:
+      traceback.print_exc()
     
   def please_stop_mirroring(self, path):
     print 'got please_stop_mirroring', path
