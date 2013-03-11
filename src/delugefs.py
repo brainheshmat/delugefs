@@ -47,6 +47,7 @@ class DelugeFS(LoggingMixIn, Operations):
     self.bt_port = self.bt_session.listen_port()
     self.bt_session.start_lsd()
     self.bt_session.start_dht()
+    self.repo = None
     print 'libtorrent listening on:', self.bt_port
     self.bt_session.add_dht_router('localhost', 10670)
     print '...is_dht_running()', self.bt_session.dht_state()
@@ -316,8 +317,14 @@ class DelugeFS(LoggingMixIn, Operations):
       #print 'resolve_callback', sdRef, flags, interfaceIndex, errorCode, fullname, hosttarget, port, txtRecord
       sname = fullname[:fullname.index('.')]
       resolved.append(True)
-      self.peers[sname] = Peer(sname, hosttarget, port)
+      apeer = Peer(sname, hosttarget, port)
+      self.peers[sname] = apeer
       print 'self.peers', self.peers
+      if self.repo:
+        self.repo.hg_pull('http://%s:%i' % (apeer.host, apeer.hg_port))
+        self.repo.hg_update('tip')
+        return 'pulling from new peer', apeer
+      
 
 
   def get_hg_port(self):
@@ -360,14 +367,14 @@ class DelugeFS(LoggingMixIn, Operations):
    
   def get_active_info_hashes(self):
     self.next_time_to_check_for_undermirrored_files = datetime.datetime.now() + datetime.timedelta(0,SECONDS_TO_NEXT_CHECK+random.randint(0,10*(1+len(self.peers))))
-    try:
-      active_info_hashes = []
-      for h in self.bt_handles.values():
+    active_info_hashes = []
+    for h in self.bt_handles.values():
+      try:
         active_info_hashes.append(str(h.get_torrent_info().name()))
-      print 'active_info_hashes', active_info_hashes
-      return active_info_hashes
-    except:
-      traceback.print_exc()
+      except:
+        traceback.print_exc()
+    print 'active_info_hashes', active_info_hashes
+    return active_info_hashes
       
   def get_free_space(self):
     f = os.statvfs(self.root)
@@ -492,25 +499,26 @@ class DelugeFS(LoggingMixIn, Operations):
       if path in self.bt_in_progress:
         print '.. in progress'
         h = self.bt_handles[path]
-        torrent_info = h.get_torrent_info()
-        piece_length = torrent_info.piece_length()
-        num_pieces = torrent_info.num_pieces()
-        start_index = offset // piece_length
-        end_index = (offset+size) // piece_length
-        print 'pieces', start_index, end_index
-        priorities = h.piece_priorities()
-        print 'priorities', priorities
-        for i in range(start_index, min(end_index+1,num_pieces)):
-          priorities[i] = 7
-        h.prioritize_pieces(priorities)
-        print 'priorities', priorities
-        #  h.piece_priority(i, 8)
-        #print 'piece_priorities set'
-        for i in range(start_index, min(end_index+1,num_pieces)):
-          print 'waiting for', i
-          while not h.have_piece(i):
-            time.sleep(1)
-          print 'we have', i
+        if not h.is_seed():
+          torrent_info = h.get_torrent_info()
+          piece_length = torrent_info.piece_length()
+          num_pieces = torrent_info.num_pieces()
+          start_index = offset // piece_length
+          end_index = (offset+size) // piece_length
+          print 'pieces', start_index, end_index
+          priorities = h.piece_priorities()
+          print 'priorities', priorities
+          for i in range(start_index, min(end_index+1,num_pieces)):
+            priorities[i] = 7
+          h.prioritize_pieces(priorities)
+          print 'priorities', priorities
+          #  h.piece_priority(i, 8)
+          #print 'piece_priorities set'
+          for i in range(start_index, min(end_index+1,num_pieces)):
+            print 'waiting for', i
+            while not h.have_piece(i):
+              time.sleep(1)
+            print 'we have', i
       os.lseek(fh, offset, 0)
       ret = os.read(fh, size)
       #print 'ret', ret
@@ -590,8 +598,8 @@ class DelugeFS(LoggingMixIn, Operations):
         try: os.mkdir(dat_dir)
         except: pass
       os.rename(tmp_fn, os.path.join(dat_dir, uid))
-      if os.path.exists(self.shadow+path): os.remove(self.shadow+path)
-      os.symlink(os.path.join(dat_dir, uid), self.shadow+path)
+      #if os.path.exists(self.shadow+path): os.remove(self.shadow+path)
+      #os.symlink(os.path.join(dat_dir, uid), self.shadow+path)
       #print 'committing', self.hgdb+path
       self.repo.hg_commit('wrote %s' % path, files=[self.hgdb+path])
       self.should_push = True
