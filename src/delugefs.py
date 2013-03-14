@@ -135,7 +135,7 @@ class DelugeFS(LoggingMixIn, Operations):
           #if s.state==5 and s.download_rate==0 and s.upload_rate==0: continue
           state_str = ['queued', 'checking', 'downloading metadata', 'downloading', 'finished', 'seeding', 'allocating']
           f.write('%s is %.2f%% complete (down: %.1f kb/s up: %.1f kB/s peers: %d) %s\n' % \
-              (path.decode('ascii', 'ignore'), s.progress * 100, s.download_rate / 1000, s.upload_rate / 1000, \
+              ("something", s.progress * 100, s.download_rate / 1000, s.upload_rate / 1000, \
               s.num_peers, ""))
     except Exception as e:
       traceback.print_exc()
