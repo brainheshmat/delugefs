@@ -362,6 +362,7 @@ class DelugeFS(LoggingMixIn, Operations):
       traceback.print_exc()
     
   def please_stop_mirroring(self, path):
+   try:
     print 'got please_stop_mirroring', path
     if path in self.last_read_file:
       if (datetime.datetime.now()-self.last_read_file[path]).seconds < 60*60*6:
@@ -376,6 +377,9 @@ class DelugeFS(LoggingMixIn, Operations):
       print 'stopped mirroring', path
       return True
     return False
+   except:
+     traceback.print_exc()
+     return False
     
    
   def get_active_info_hashes(self):
@@ -646,10 +650,13 @@ class DelugeFS(LoggingMixIn, Operations):
   def rmdir(self, path):
     with self.rwlock:
       if path.startswith('/.__delugefs__'): return 0
-      self.repo.hg_remove(self.hgdb+path+'/.__delugefs_dir__')
-      self.repo.hg_commit('rmdir %s' % path, files=[self.hgdb+path+'/.__delugefs_dir__'])
-      self.should_push = True
-      #return os.rmdir(self.hgdb+path)
+      fn = self.hgdb+path+'/.__delugefs_dir__'
+      if os.path.isfile(fn):
+        self.repo.hg_remove(fn)
+        self.repo.hg_commit('rmdir %s' % path, files=[fn])
+        self.should_push = True
+      if os.path.isdir(self.hgdb+path):
+        os.rmdir(self.hgdb+path)
 
   def statfs(self, path):
     fn = self.hgdb + path
@@ -678,17 +685,24 @@ class DelugeFS(LoggingMixIn, Operations):
   def unlink(self, path):
     with self.rwlock:
       if path.startswith('/.__delugefs__'): return 0
-      with open(self.hgdb+path, 'rb') as f:
+      fn = (self.hgdb+path).encode(FS_ENCODE)
+      with open(fn, 'rb') as f:
         torrent = lt.bdecode(f.read())
         torrent_info = torrent.get('info')  if torrent else None
-        name = torrent_info.get('name') if torrent_info else 0
+        name = torrent_info.get('name') if torrent_info else ''
         dfn = os.path.join(self.dat, name[:2], name)
         if os.path.isfile(dfn):
           os.remove(dfn)
           print 'deleted', dfn
-      self.repo.hg_remove(self.hgdb+path)
-      self.repo.hg_commit('unlink %s' % path, files=[self.hgdb+path])
-      self.should_push = True
+      if True:#try:
+        self.repo.hg_remove(fn)
+        self.repo.hg_commit('unlink', files=[fn])
+        self.should_push = True
+      #except Exception as e:
+      #  if 'file is untracked' in str(e):
+      #    os.remove(self.hgdb+path)
+      #  else:
+      #    raise e
 
   def write(self, path, data, offset, fh):
     with self.rwlock:

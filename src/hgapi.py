@@ -64,8 +64,12 @@ class Repo(object):
 
     def hg_command(self, *args):
         """Run a hg command in path and return the result.
-        Throws on error."""    
-        print (" ".join(["hg",] + ['"%s"'%x if ' ' in x else x for x in args]))
+        Throws on error."""
+        try:
+          print (" ".join(["hg",] + ['"%s"'%x if ' ' in x else x for x in args]))
+        except:
+          pass
+          #print '''bummer, can't print command!'''
         proc = Popen(["hg", "--cwd", self.path, "--encoding", "UTF-8"] + list(args), stdout=PIPE, stderr=PIPE, env=self._env)
         out, err = [x.decode("utf-8") for x in  proc.communicate()]
 
