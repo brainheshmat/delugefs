@@ -9,6 +9,8 @@ import jsonrpc
 
 
 SECONDS_TO_NEXT_CHECK = 120
+FS_ENCODE = sys.getfilesystemencoding()
+if not FS_ENCODE: FS_ENCODE = 'utf-8'
 
 class Peer(object):
   def __init__(self, service_name, host, port):
@@ -25,10 +27,10 @@ class DelugeFS(LoggingMixIn, Operations):
   def __init__(self, name, root, create=False):
     self.name = name
     self.root = os.path.realpath(root)
-    self.hgdb = os.path.join(self.root, 'hgdb')
+    self.hgdb = os.path.join(self.root, u'hgdb')
     self.tmp = os.path.join(self.root, 'tmp')
     self.dat = os.path.join(self.root, 'dat')
-    self.shadow = os.path.join(self.root, 'shadow')
+    self.shadow = os.path.join(self.root, u'shadow')
     self.rpc_port = random.randint(10000, 20000)
     self.hg_port = random.randint(10000, 20000)
     self.peers = {}
@@ -103,6 +105,8 @@ class DelugeFS(LoggingMixIn, Operations):
     self.rwlock = threading.Lock()
     self.open_files = {}
     print 'init', self.hgdb
+    self.repo.hg_status()
+    self.repo.hg_update('--clean')
     t = threading.Thread(target=self.__register, args=())
     t.daemon = True
     t.start()
@@ -173,6 +177,9 @@ class DelugeFS(LoggingMixIn, Operations):
           if fn=='.__delugefs_dir__': continue
           fn = os.path.join(root, fn)
           e = get_torrent_dict(fn)
+          if not e:
+            print 'not a torrent?', fn
+            continue
           uid = e['info']['name']
           size = e['info']['length']
           path = fn[len(self.hgdb):]
@@ -227,6 +234,9 @@ class DelugeFS(LoggingMixIn, Operations):
         fn = os.path.join(root, fn)
         print 'loading torrent', fn
         e = get_torrent_dict(fn)
+        if not e:
+          print 'not able to read torrent', fn
+          continue
         #with open(fn,'rb') as f:
         #  e = lt.bdecode(f.read())
         uid = e['info']['name']
@@ -642,8 +652,10 @@ class DelugeFS(LoggingMixIn, Operations):
       #return os.rmdir(self.hgdb+path)
 
   def statfs(self, path):
-        stv = os.statvfs(self.hgdb+path)
-        return dict((key, getattr(stv, key)) for key in ('f_bavail', 'f_bfree',
+    fn = self.hgdb + path
+    #print repr(fn)
+    stv = os.statvfs(fn.encode(FS_ENCODE))
+    return dict((key, getattr(stv, key)) for key in ('f_bavail', 'f_bfree',
             'f_blocks', 'f_bsize', 'f_favail', 'f_ffree', 'f_files', 'f_flag',
             'f_frsize', 'f_namemax'))
 
@@ -715,7 +727,7 @@ if __name__ == '__main__':
       k = s[2:]
     else:
       if k:
-        config[k] = s
+        config[k] = s.encode(FS_ENCODE)
         k = None
         
   if not 'cluster' in config:
