@@ -357,9 +357,14 @@ class DelugeFS(LoggingMixIn, Operations):
       print 'please_mirror', path
       fn = self.hgdb+path
       torrent = get_torrent_dict(fn)
-      self.__add_torrent(torrent, path)
+      if torrent:
+        self.__add_torrent(torrent, path)
+        return True
+      else:
+        return False
     except:
       traceback.print_exc()
+      return False
     
   def please_stop_mirroring(self, path):
    try:
@@ -386,6 +391,7 @@ class DelugeFS(LoggingMixIn, Operations):
     self.next_time_to_check_for_undermirrored_files = datetime.datetime.now() + datetime.timedelta(0,SECONDS_TO_NEXT_CHECK+random.randint(0,10*(1+len(self.peers))))
     active_info_hashes = []
     for h in self.bt_handles.values():
+      if not h: continue
       try:
         active_info_hashes.append(str(h.get_torrent_info().name()))
       except:
