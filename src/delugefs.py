@@ -97,6 +97,16 @@ class DelugeFS(LoggingMixIn, Operations):
           traceback.print_exc()
           raise e
         print 'success cloning repo!'
+        
+    for path in self.repo.hg_status()['?']:
+      fn = os.path.join(self.hgdb, path)
+      print 'deleting untracked file', fn
+      os.remove(fn)
+    
+    prune_empty_dirs(self.hgdb)
+    
+    #self.repo.hg_summary()
+    print '='*80
       
     if not os.path.isdir(self.tmp): os.makedirs(self.tmp)
     for fn in os.listdir(self.tmp): os.remove(os.path.join(self.tmp,fn))
@@ -197,7 +207,7 @@ class DelugeFS(LoggingMixIn, Operations):
                 self.peers[best_peer_id].server.please_mirror(path)
                 self.peers[best_peer_id].free_space -= size
               break
-          if counter[uid] > 2:
+          if counter[uid] > 3:
             print 'uid_peers', uid_peers
             peer_free_space_list = sorted([x for x in peer_free_space.items() if x[0] in uid_peers[uid]], lambda x,y: x[1]>y[1])
             print 'peer_free_space_list2', peer_free_space_list
@@ -257,6 +267,9 @@ class DelugeFS(LoggingMixIn, Operations):
     info = lt.torrent_info(t)
     dat_file = os.path.join(self.dat, uid[:2], uid)
     if not os.path.isdir(os.path.dirname(dat_file)): os.mkdir(os.path.dirname(dat_file))
+    if not os.path.isfile(dat_file):
+      with open(dat_file,'wb') as f:
+        pass
     h = self.bt_session.add_torrent({'ti':info, 'save_path':os.path.join(self.dat, uid[:2])})
     #h.set_sequential_download(True)
     for peer in self.peers.values():
@@ -265,8 +278,8 @@ class DelugeFS(LoggingMixIn, Operations):
     print 'added ', path
     self.bt_handles[path] = h
     self.bt_in_progress.add(path)
-    while not os.path.isfile(dat_file):
-      time.sleep(.1)
+    #while not os.path.isfile(dat_file):
+    #  time.sleep(.1)
     print 'file created'
 
  
@@ -373,12 +386,16 @@ class DelugeFS(LoggingMixIn, Operations):
       if (datetime.datetime.now()-self.last_read_file[path]).seconds < 60*60*6:
         print 'reject - too soon since we last used it', path
         return False
+    
+    print 'i would have stopped', path
+    return False
         
     h = self.bt_handles[path]
     if h:
       uid = h.get_torrent_info().name()
       self.bt_session.remove_torrent(h)
-      os.remove(os.path.join(self.dat, uid[:2], uid))
+      fn = os.path.join(self.dat, uid[:2], uid)
+      if os.path.isfile(fn): os.remove(fn)
       print 'stopped mirroring', path
       return True
     return False
@@ -390,12 +407,13 @@ class DelugeFS(LoggingMixIn, Operations):
   def get_active_info_hashes(self):
     self.next_time_to_check_for_undermirrored_files = datetime.datetime.now() + datetime.timedelta(0,SECONDS_TO_NEXT_CHECK+random.randint(0,10*(1+len(self.peers))))
     active_info_hashes = []
-    for h in self.bt_handles.values():
+    for k,h in self.bt_handles.items():
       if not h: continue
       try:
         active_info_hashes.append(str(h.get_torrent_info().name()))
       except:
         traceback.print_exc()
+        del self.bt_handles[k]
     print 'active_info_hashes', active_info_hashes
     return active_info_hashes
       
@@ -443,14 +461,18 @@ class DelugeFS(LoggingMixIn, Operations):
       print '...bonjour listener', name+'.'+regtype+domain, 'now listening on', self.rpc_port
 
   def __call__(self, op, path, *args):
-    print op, path, ('...data...' if op=='write' else args)
+    cid = random.randint(10000, 20000)
+    print op, path, ('...data...' if op=='write' else args), cid
     if path.startswith('/.Trash'): raise FuseOSError(errno.EACCES)
     if path.endswith('/.__delugefs_dir__'): raise FuseOSError(errno.EACCES)
-    return super(DelugeFS, self).__call__(op, path, *args)
+    ret = super(DelugeFS, self).__call__(op, path, *args)
+    print '...', cid
+    return ret
 
   def access(self, path, mode):
     if not os.access(self.hgdb+path, mode):
       raise FuseOSError(errno.EACCES)
+    #return os.access(self.hgdb+path, mode)
 
 #  chmod = os.chmod
 #  chown = os.chown
@@ -530,7 +552,7 @@ class DelugeFS(LoggingMixIn, Operations):
           end_index = (offset+size) // piece_length
           print 'pieces', start_index, end_index
           priorities = h.piece_priorities()
-          print 'priorities', priorities
+          #print 'priorities', priorities
           for i in range(start_index, min(end_index+1,num_pieces)):
             priorities[i] = 7
           h.prioritize_pieces(priorities)
@@ -539,7 +561,8 @@ class DelugeFS(LoggingMixIn, Operations):
           #print 'piece_priorities set'
           for i in range(start_index, min(end_index+1,num_pieces)):
             print 'waiting for', i
-            while not h.have_piece(i):
+            for i in range(10):
+              if h.have_piece(i): break
               time.sleep(1)
             print 'we have', i
       os.lseek(fh, offset, 0)
@@ -721,7 +744,19 @@ def get_torrent_dict(fn):
   with open(fn, 'rb') as f:
     return lt.bdecode(f.read())
 
-
+def prune_empty_dirs(path):
+  empty = True
+  for fn in os.listdir(path):
+    ffn = os.path.join(path, fn)
+    if os.path.isdir(ffn):
+      if not prune_empty_dirs(ffn):
+        empty = False
+    else:
+      empty = False
+  if empty:
+    print 'pruning', path
+    os.rmdir(path)
+  return empty
 
 
 resolved = []
